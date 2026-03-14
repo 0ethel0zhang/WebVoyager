@@ -5,17 +5,17 @@ import asyncio
 import subprocess
 import re
 from typing import List, Optional, Dict, Any
-from google import genai
-from google.genai import types
+import google.generativeai as genai
+from google.generativeai.types import content_types
 
 # Constants
-DEFAULT_MODEL = "gemini-3.1-pro-preview"
-CONTEXT_LIMIT = 1_000_000  # Conservative estimate for alerting
+DEFAULT_MODEL = "gemini-2.0-pro-exp-02-05"
+CONTEXT_LIMIT = 1_000_000
 
 class Repoimprover:
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL, root_path: str = "."):
-        self.client = genai.Client(api_key=api_key)
-        self.model = model
+        genai.configure(api_key=api_key)
+        self.model_name = model
         self.root_path = os.path.abspath(root_path)
         self.repo_context = ""
         self.total_tokens = 0
@@ -52,7 +52,6 @@ class Repoimprover:
         self.created_files.clear()
 
     def commit_changes(self):
-        """Clear backups so that future rollbacks don't undo current successful changes."""
         self.backups.clear()
         self.created_files.clear()
 
@@ -95,9 +94,9 @@ class Repoimprover:
 
         full_context = "\n".join(context)
 
+        model = genai.GenerativeModel(self.model_name)
         try:
-            resp = self.client.models.count_tokens(model=self.model, contents=full_context)
-            self.total_tokens = resp.total_tokens
+            self.total_tokens = model.count_tokens(full_context).total_tokens
         except:
             self.total_tokens = len(full_context) // 4
 
@@ -109,8 +108,6 @@ class Repoimprover:
 
     async def run(self, user_prompt: str, screenshot_paths: List[str] = None):
         print(f"Analyzing repository with prompt: {user_prompt}")
-        if screenshot_paths:
-            print(f"Including {len(screenshot_paths)} screenshots in context.")
 
         system_instruction = """You are a repository improvement agent using Gemini 3.
 You have access to the entire repository content. Your goal is to solve the problem described in the user prompt.
@@ -137,31 +134,31 @@ Example:
 <THOUGHT>I will start by checking the existing tests.</THOUGHT>
 <RUN>pytest</RUN>
 """
-        user_parts: List[Any] = [f"System Instruction: {system_instruction}\n\nRepository Context:\n{self.repo_context}\n\nUser Prompt: {user_prompt}"]
+        model = genai.GenerativeModel(self.model_name, system_instruction=system_instruction)
 
+        initial_content = [f"Repository Context:\n{self.repo_context}\n\nUser Prompt: {user_prompt}"]
         if screenshot_paths:
+            print(f"Including {len(screenshot_paths)} screenshots in context.")
             for path in screenshot_paths:
                 try:
-                    with open(path, "rb") as f:
-                        image_data = f.read()
-                        # Extract mime type
-                        mime_type = "image/png" if path.lower().endswith(".png") else "image/jpeg"
-                        user_parts.append(types.Part.from_bytes(data=image_data, mime_type=mime_type))
+                    # google-generativeai expects PIL Image or bytes with mime type
+                    import PIL.Image
+                    img = PIL.Image.open(path)
+                    initial_content.append(img)
                 except Exception as e:
                     print(f"Error loading screenshot {path}: {e}")
 
-        history = [
-            {"role": "user", "parts": user_parts}
-        ]
+        chat = model.start_chat(history=[])
+        current_user_msg = "\n".join([c if isinstance(c, str) else "[Image Content]" for c in initial_content])
+        # We need to send images in the first message
+        first_msg_parts = initial_content
 
         while True:
-            response_stream = await self.client.aio.models.generate_content_stream(
-                model=self.model,
-                contents=history,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                )
-            )
+            if first_msg_parts:
+                response_stream = await chat.send_message_async(first_msg_parts, stream=True)
+                first_msg_parts = None
+            else:
+                response_stream = await chat.send_message_async(current_user_msg, stream=True)
 
             full_response = ""
             streaming_buffer = ""
@@ -172,7 +169,6 @@ Example:
                 full_response += text
                 streaming_buffer += text
 
-                # Highlight thoughts during streaming, handling potential splits
                 if "<THOUGHT>" in streaming_buffer and not in_thought:
                     sys.stdout.write("\033[94m[THOUGHT]\033[0m ")
                     in_thought = True
@@ -181,29 +177,25 @@ Example:
 
                 sys.stdout.write(text)
                 sys.stdout.flush()
-                # Keep only last 20 chars in buffer to catch split tags
                 streaming_buffer = streaming_buffer[-20:]
-
-            history.append({"role": "model", "parts": [full_response]})
 
             if "<ROLLBACK" in full_response:
                 print("\nRolling back changes from this turn...")
                 self.restore_all()
-                history.append({"role": "user", "parts": ["The changes from the previous turn have been rolled back."]})
+                current_user_msg = "The changes from the previous turn have been rolled back."
                 continue
 
-            # Handle EDIT and RUN in parallel where possible
             edits = re.findall(r'<EDIT path="(.*?)">(.*?)</EDIT>', full_response, re.DOTALL)
             runs = re.findall(r'<RUN>(.*?)</RUN>', full_response, re.DOTALL)
 
             action_tasks = []
-
-            # Edits are usually fast and sequential is safer for now, but we can apply them quickly
             for path, content in edits:
                 print(f"\nApplying edit to {path}...")
-                self.apply_change(path, content)
+                try:
+                    self.apply_change(path, content)
+                except ValueError as e:
+                    print(f"Error: {e}")
 
-            # Commands can definitely be run in parallel
             for cmd in runs:
                 print(f"\nQueueing command: {cmd}")
                 action_tasks.append(self.run_command(cmd))
@@ -220,27 +212,18 @@ Example:
                 for i, res in enumerate(run_results):
                     result_parts.append(f"Command: {runs[i]}\nResult: {res}")
 
-                # Check for automatic rollback if tests failed
-                # If any RUN failed and there were edits, we might want to rollback
-                # This is a bit complex for multiple runs, but let's assume if any RUN fails, it's a regression
                 if edits and any("RETURN CODE: 0" not in res for res in run_results):
                     print("\nTest failed. Rolling back edits for this turn...")
                     self.restore_all()
                     result_parts.append("CRITICAL: A command failed. All edits from this turn have been rolled back.")
                 else:
-                    # Success! Commit changes so they persist.
                     self.commit_changes()
 
-            # Handle CLARIFY without blocking other actions
             clarifications = re.findall(r'<CLARIFY>(.*?)</CLARIFY>', full_response, re.DOTALL)
             for clarification in clarifications:
                 user_input = await asyncio.to_thread(input, f"\n[CLARIFICATION REQUESTED: {clarification.strip()}] Please respond: ")
                 result_parts.append(f"User Clarification for '{clarification.strip()}': {user_input}")
 
-            if result_parts:
-                history.append({"role": "user", "parts": ["\n\n".join(result_parts)]})
-
-            # Termination check AFTER processing actions
             if "<SOLVED>" in full_response:
                 print("\nTask marked as SOLVED.")
                 break
@@ -248,16 +231,17 @@ Example:
                 print("\nTask marked as IMPOSSIBLE.")
                 break
 
-            if not result_parts:
-                # If no explicit action but not solved, maybe it's just thinking or forgot tags
+            if result_parts:
+                current_user_msg = "\n\n".join(result_parts)
+            else:
                 if not any(tag in full_response for tag in ["<SOLVED>", "<IMPOSSIBLE>", "<CLARIFY>", "<EDIT>", "<RUN>"]):
-                     history.append({"role": "user", "parts": ["Please continue or provide an action (EDIT, RUN, CLARIFY, SOLVED, IMPOSSIBLE)."]})
+                     current_user_msg = "Please continue or provide an action (EDIT, RUN, CLARIFY, SOLVED, IMPOSSIBLE)."
 
 async def main():
     parser = argparse.ArgumentParser(description="Improve a repository using Gemini 3")
     parser.add_argument("prompt", help="The improvement prompt")
     parser.add_argument("--path", default=".", help="Path to the repository (default: current directory)")
-    parser.add_argument("--model", default="gemini-2.0-pro-exp-02-05", help=f"Gemini model to use (default: gemini-2.0-pro-exp-02-05)")
+    parser.add_argument("--model", default="gemini-2.0-pro-exp-02-05", help=f"Gemini model to use")
     parser.add_argument("--screenshots", nargs="+", help="Paths to screenshots to include as context")
 
     args = parser.parse_args()
