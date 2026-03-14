@@ -14,8 +14,8 @@ CONTEXT_LIMIT = 1_000_000
 
 class Repoimprover:
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL, root_path: str = "."):
-        # Using transport='rest' to avoid common gRPC illegal header issues
-        genai.configure(api_key=api_key, transport='rest')
+        # Stripping key and using default transport to avoid Latin-1 issues with 'rest'
+        genai.configure(api_key=api_key)
         self.model_name = model
         self.root_path = os.path.abspath(root_path)
         self.repo_context = ""
