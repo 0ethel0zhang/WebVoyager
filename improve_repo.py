@@ -78,15 +78,28 @@ class Repoimprover:
 
     def read_repo(self, path: str, skip_hidden: bool = True) -> str:
         context = []
+        # Common directories to skip to reduce payload size
+        skip_dirs = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', 'dist', 'build', 'target'}
+
         for root, dirs, files in os.walk(path):
             if skip_hidden:
-                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in skip_dirs]
                 files = [f for f in files if not f.startswith('.')]
+            else:
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
 
             for file in files:
                 file_path = os.path.join(root, file)
+
+                # Skip large files to avoid 503/Timeout errors (e.g., > 100KB)
+                try:
+                    if os.path.getsize(file_path) > 100 * 1024:
+                        continue
+                except:
+                    continue
+
                 # Skip common binary extensions
-                binary_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.pdf', '.pyc', '.exe', '.bin', '.zip', '.tar', '.gz'}
+                binary_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.pdf', '.pyc', '.exe', '.bin', '.zip', '.tar', '.gz', '.woff', '.woff2', '.ttf', '.eot'}
                 if os.path.splitext(file)[1].lower() in binary_extensions:
                     continue
 
@@ -151,7 +164,12 @@ Example:
 """
         model = genai.GenerativeModel(self.model_name, system_instruction=system_instruction)
 
-        initial_content = [f"Repository Context:\n{self.repo_context}\n\nUser Prompt: {user_prompt}"]
+        # Split repo context if too large, or just warn
+        repo_msg = f"Repository Context:\n{self.repo_context}"
+        if len(repo_msg) > 500000: # 500k chars is a lot for a single turn in some environments
+             print("WARNING: Repository context is very large. This may cause 503 or Timeout errors.")
+
+        initial_content = [repo_msg, f"User Prompt: {user_prompt}"]
         if screenshot_paths:
             print(f"Including {len(screenshot_paths)} screenshots in context.")
             for path in screenshot_paths:
@@ -169,11 +187,18 @@ Example:
         first_msg_parts = initial_content
 
         while True:
-            if first_msg_parts:
-                response_stream = await chat.send_message_async(first_msg_parts, stream=True)
-                first_msg_parts = None
-            else:
-                response_stream = await chat.send_message_async(current_user_msg, stream=True)
+            try:
+                if first_msg_parts:
+                    response_stream = await chat.send_message_async(first_msg_parts, stream=True)
+                    first_msg_parts = None
+                else:
+                    response_stream = await chat.send_message_async(current_user_msg, stream=True)
+            except Exception as e:
+                print(f"\nAPI Error: {e}")
+                if "503" in str(e) or "Timeout" in str(e):
+                    print("This error often occurs when the request payload is too large or the service is overloaded.")
+                    print("Try reducing the number of files or the complexity of the prompt.")
+                break
 
             full_response = ""
             streaming_buffer = ""
