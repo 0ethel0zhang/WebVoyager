@@ -85,11 +85,25 @@ class Repoimprover:
 
             for file in files:
                 file_path = os.path.join(root, file)
+                # Skip common binary extensions
+                binary_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.pdf', '.pyc', '.exe', '.bin', '.zip', '.tar', '.gz'}
+                if os.path.splitext(file)[1].lower() in binary_extensions:
+                    continue
+
                 try:
+                    # Check if file is binary by reading the first block
+                    with open(file_path, 'rb') as f:
+                        chunk = f.read(1024)
+                        if b'\x00' in chunk: # Simple binary check
+                            continue
+
                     with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read()
                         relative_path = os.path.relpath(file_path, path)
                         context.append(f"--- FILE: {relative_path} ---\n{content}\n")
+                except UnicodeDecodeError:
+                    # Silently skip files that can't be decoded as UTF-8
+                    continue
                 except Exception as e:
                     print(f"Skipping {file_path}: {e}")
 
