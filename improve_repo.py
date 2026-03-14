@@ -251,6 +251,9 @@ async def main():
         print("Error: GOOGLE_API_KEY environment variable not set.")
         sys.exit(1)
 
+    # Strip whitespace/newlines which can cause gRPC "Illegal header value" errors
+    api_key = api_key.strip()
+
     improver = Repoimprover(api_key, model=args.model, root_path=args.path)
     improver.read_repo(args.path)
     await improver.run(args.prompt, screenshot_paths=args.screenshots)
